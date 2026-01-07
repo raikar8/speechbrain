@@ -200,9 +200,72 @@ modules:
 - Better handling of diverse environmental noise
 - Improved generalization across noise types and SNR levels
 
-## Future Versions
+### Version 3: Hybrid Routing
 
-- **Version 3**: Hybrid routing (combine timestep and noise-based routing)
+This version implements hybrid routing, combining both timestep-based and noise-based routing strategies.
+
+**Key Features:**
+- **Basis Models**: Trains only `K` basis models (e.g., K=4) instead of `N` independent experts
+- **Learnable Mixing**: Creates `N` experts (e.g., N=100) by mixing `K` basis models using learnable coefficients
+- **Hybrid Routing**: Routes to experts based on BOTH:
+  - **Timestep**: Diffusion timestep `t` (discretized into bins)
+  - **Noise Characteristics**: SNR and noise type (environmental noise)
+- **Routing Strategies**: 
+  - `"grid"`: Creates a 3D grid of experts (t_bin, snr_bin, noise_type)
+  - `"hierarchical"`: First routes by noise, then by timestep
+
+**Architecture:**
+
+1. **Multi-Dimensional Routing**:
+   - Timestep binning: Discretize `t` into `num_timestep_bins` bins
+   - SNR binning: Discretize SNR into `num_snr_bins` bins
+   - Noise type classification: Classify into `num_noise_types` categories
+
+2. **Expert ID Mapping**:
+   - **Grid Strategy**: `expert_id = (t_bin * num_snr_bins * num_noise_types) + (snr_bin * num_noise_types) + noise_type_id`
+   - **Hierarchical Strategy**: `expert_id = (noise_expert * num_timestep_bins) + t_bin`
+     where `noise_expert = snr_bin * num_noise_types + noise_type_id`
+
+3. **Expected Number of Experts**:
+   - For full coverage: `num_experts >= num_timestep_bins * num_snr_bins * num_noise_types`
+   - Example: 10 timestep bins × 5 SNR bins × 5 noise types = 250 experts
+   - Can use fewer experts (will share via modulo)
+
+**Usage:**
+
+```yaml
+modules:
+  score_model: !new:speechbrain.integrations.models.sgmse_moe_hybrid.ScoreModelMoEHybrid
+    K: 4                    # Number of basis models
+    num_experts: 100        # Number of experts (should be >= num_timestep_bins * num_snr_bins * num_noise_types)
+    num_timestep_bins: 10   # Number of timestep bins
+    num_snr_bins: 5         # Number of SNR bins
+    num_noise_types: 5      # Number of noise type categories
+    routing_strategy: grid  # "grid" or "hierarchical"
+    use_noise_classifier: True
+    snr_range: [-5, 20]
+    # ... other parameters same as ScoreModel
+```
+
+**Key Parameters:**
+- **num_timestep_bins**: Number of bins for timestep `t` (default: 10)
+- **num_snr_bins**: Number of SNR bins (default: 5)
+- **num_noise_types**: Number of noise type categories (default: 5)
+- **routing_strategy**: How to combine dimensions:
+  - `"grid"`: 3D grid mapping (recommended for full coverage)
+  - `"hierarchical"`: Two-level hierarchy (noise first, then timestep)
+- **num_experts**: Should be >= `num_timestep_bins * num_snr_bins * num_noise_types` for full coverage
+
+**Expected Benefits:**
+- Maximum specialization: Experts can specialize for specific (timestep, SNR, noise_type) combinations
+- Best of both worlds: Combines benefits of timestep and noise-based routing
+- Fine-grained control: More granular expert selection
+
+**Example Expert Mapping (Grid Strategy):**
+- Expert 0: (t_bin=0, snr_bin=0, noise_type=0) - Early timestep, low SNR, white noise
+- Expert 25: (t_bin=1, snr_bin=0, noise_type=0) - Mid timestep, low SNR, white noise
+- Expert 50: (t_bin=0, snr_bin=1, noise_type=0) - Early timestep, mid SNR, white noise
+- etc.
 
 ## References
 
