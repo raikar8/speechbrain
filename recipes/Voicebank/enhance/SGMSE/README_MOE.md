@@ -1,6 +1,8 @@
-# SGMSE with Mixture of Experts (Remix-DiT Style)
+# SGMSE with Mixture of Experts
 
-This implementation adds Mixture of Experts (MoE) capability to SGMSE, following the approach from **Remix-DiT: Mixing Diffusion Transformers for Multi-Expert Denoising** (arXiv:2412.05628).
+This implementation adds Mixture of Experts (MoE) capability to SGMSE with two routing strategies:
+1. **Version 1**: Timestep-based routing (Remix-DiT style)
+2. **Version 2**: Noise-based routing (environmental noise characteristics)
 
 ## Overview
 
@@ -143,9 +145,63 @@ Based on Remix-DiT findings:
 2. **Adaptive Capacity**: Learnable coefficients allocate more capacity where needed
 3. **Efficient Training**: Train K models instead of N independent models
 
+### Version 2: Noise-Based Routing
+
+This version implements noise-based expert routing, where different experts are activated based on environmental noise characteristics (SNR, noise type).
+
+**Key Features:**
+- **Basis Models**: Trains only `K` basis models (e.g., K=4) instead of `N` independent experts
+- **Learnable Mixing**: Creates `N` experts (e.g., N=25) by mixing `K` basis models using learnable coefficients
+- **Noise-Based Routing**: Routes to different experts based on:
+  - **SNR**: Signal-to-Noise Ratio (discretized into bins, e.g., -5 to 20 dB)
+  - **Noise Type**: Type of environmental noise (white, babble, street, car, etc.)
+- **Noise Classification**: Optional learned classifier for noise type, or heuristic-based
+
+**Architecture:**
+
+1. **Noise Estimation**:
+   - SNR: Estimated from noisy vs clean signal (if available) or heuristically
+   - Noise Type: Classified using learned MLP or spectral characteristics
+
+2. **Expert Routing**:
+   - Map (SNR_bin, noise_type) → expert_id
+   - Expert grid: `expert_id = noise_type_id * num_snr_bins + snr_bin`
+
+3. **Mixing**:
+   - Same basis model mixing as Version 1
+   - Mixing coefficients learned per (SNR, noise_type) combination
+
+**Usage:**
+
+```yaml
+modules:
+  score_model: !new:speechbrain.integrations.models.sgmse_moe_noise.ScoreModelMoENoise
+    K: 4                    # Number of basis models
+    num_experts: 25         # Number of experts (should be >= num_snr_bins * num_noise_types)
+    num_snr_bins: 5         # Number of SNR bins
+    num_noise_types: 5       # Number of noise type categories
+    use_noise_classifier: True  # Use learned classifier
+    snr_range: [-5, 20]     # SNR range in dB
+    # ... other parameters same as ScoreModel
+```
+
+**Key Parameters:**
+- **num_snr_bins**: Number of SNR bins (default: 5)
+  - More bins = finer-grained SNR routing
+- **num_noise_types**: Number of noise type categories (default: 5)
+  - Categories: white, babble, street, car, etc.
+- **use_noise_classifier**: Whether to use learned classifier (default: True)
+  - True: Train MLP to classify noise type
+  - False: Use heuristic based on spectral characteristics
+- **snr_range**: SNR range in dB for binning (default: [-5, 20])
+
+**Expected Benefits:**
+- Experts specialize for different noise conditions
+- Better handling of diverse environmental noise
+- Improved generalization across noise types and SNR levels
+
 ## Future Versions
 
-- **Version 2**: Noise-based routing (route by environmental noise characteristics)
 - **Version 3**: Hybrid routing (combine timestep and noise-based routing)
 
 ## References

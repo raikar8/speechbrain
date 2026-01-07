@@ -89,7 +89,7 @@ class SGMSEBrain(sb.Brain):
             n_fft=n_fft, hop_length=hop, center=True, return_complex=True
         )
 
-    def _step(self, x, y, model):
+    def _step(self, x, y, model, snr_db=None, noise_type_id=None):
         """
         Perform a single diffusion step for the score-based model.
 
@@ -105,6 +105,10 @@ class SGMSEBrain(sb.Brain):
             Conditioning or auxiliary input spectrogram, of shape (B, 1, F, T).
         model: nn.Module
             Score-based generative model that contains the SDE and the forward method.
+        snr_db: torch.Tensor, optional
+            Ground-truth SNR in dB, shape (B,). Used for noise-based MoE routing.
+        noise_type_id: torch.Tensor, optional
+            Ground-truth noise type IDs, shape (B,). Used for noise-based MoE routing.
 
         Returns
         -------
@@ -134,7 +138,11 @@ class SGMSEBrain(sb.Brain):
         )  # (B,1,F,T), i.i.d. normal distributed with var=0.5
         sigma = std[:, None, None, None]  # (B,1,1,1)
         x_t = mean + sigma * z  # (B,1,F,T)
-        forward_out = model(x_t, y, t)
+        # Pass x (clean signal) and labels if model supports it (for noise-based MoE)
+        if hasattr(model, '_estimate_snr'):
+            forward_out = model(x_t, y, t, x=x, snr_db=snr_db, noise_type_id=noise_type_id)
+        else:
+            forward_out = model(x_t, y, t)
 
         return {
             "forward_out": forward_out,
@@ -176,11 +184,31 @@ class SGMSEBrain(sb.Brain):
         x_wav = batch.clean_sig.data  # (B,S)
         y_wav = batch.noisy_sig.data  # (B,S)
 
+        # Extract labels if available (for noise-based MoE)
+        snr_db = None
+        noise_type_id = None
+        if hasattr(batch, 'snr_db'):
+            # Handle both PaddedBatch and regular batch formats
+            snr_db = getattr(batch.snr_db, 'data', batch.snr_db)
+            if isinstance(snr_db, torch.Tensor):
+                snr_db = snr_db.to(self.device)
+            else:
+                # Convert list/array to tensor
+                snr_db = torch.tensor(snr_db, dtype=torch.float32, device=self.device)
+        if hasattr(batch, 'noise_type_id'):
+            # Handle both PaddedBatch and regular batch formats
+            noise_type_id = getattr(batch.noise_type_id, 'data', batch.noise_type_id)
+            if isinstance(noise_type_id, torch.Tensor):
+                noise_type_id = noise_type_id.to(self.device)
+            else:
+                # Convert list/array to tensor
+                noise_type_id = torch.tensor(noise_type_id, dtype=torch.long, device=self.device)
+
         # STFT, Spec transformations, adding channel dim
         x = self.spec_fwd(self.stft(x_wav)).unsqueeze(1)  # (B,1,F,T)
         y = self.spec_fwd(self.stft(y_wav)).unsqueeze(1)  # (B,1,F,T)
 
-        outs = self._step(x, y, model)
+        outs = self._step(x, y, model, snr_db=snr_db, noise_type_id=noise_type_id)
 
         # TRAIN: never run enhancement
         if stage == sb.Stage.TRAIN:
@@ -732,60 +760,137 @@ def dataio_prep(hparams):
     random_crop_valid = hparams.get("random_crop_valid", False)
     random_crop_test = hparams.get("random_crop_test", False)
 
-    def build_pipeline(random_crop):
-        @sb.utils.data_pipeline.takes("noisy_wav", "clean_wav")
-        @sb.utils.data_pipeline.provides("noisy_sig", "clean_sig")
-        def wav_pairs(noisy_wav, clean_wav):
-            # Load waveforms
-            sig_noisy = sb.dataio.dataio.read_audio(noisy_wav)
-            sig_clean = sb.dataio.dataio.read_audio(clean_wav)
+    def build_pipeline(random_crop, use_labels=False):
+        if use_labels:
+            @sb.utils.data_pipeline.takes("noisy_wav", "clean_wav", "snr_db", "noise_type_id")
+            @sb.utils.data_pipeline.provides("noisy_sig", "clean_sig", "snr_db", "noise_type_id")
+            def wav_pairs(noisy_wav, clean_wav, snr_db, noise_type_id):
+                # Load waveforms
+                sig_noisy = sb.dataio.dataio.read_audio(noisy_wav)
+                sig_clean = sb.dataio.dataio.read_audio(clean_wav)
 
-            orig_len = sig_clean.shape[-1]
-            # Pad if too short
-            if orig_len < target_len:
-                needed = target_len - orig_len
-                left_pad = needed // 2
-                right_pad = needed - left_pad
-                sig_noisy = F.pad(
-                    sig_noisy, (left_pad, right_pad), mode="constant"
-                )
-                sig_clean = F.pad(
-                    sig_clean, (left_pad, right_pad), mode="constant"
-                )
-            # Crop if too long
-            elif orig_len > target_len:
-                if random_crop:
-                    start = np.random.randint(0, orig_len - target_len)
+                orig_len = sig_clean.shape[-1]
+                # Pad if too short
+                if orig_len < target_len:
+                    needed = target_len - orig_len
+                    left_pad = needed // 2
+                    right_pad = needed - left_pad
+                    sig_noisy = F.pad(
+                        sig_noisy, (left_pad, right_pad), mode="constant"
+                    )
+                    sig_clean = F.pad(
+                        sig_clean, (left_pad, right_pad), mode="constant"
+                    )
+                # Crop if too long
+                elif orig_len > target_len:
+                    if random_crop:
+                        start = np.random.randint(0, orig_len - target_len)
+                    else:
+                        start = (orig_len - target_len) // 2
+                    sig_noisy = sig_noisy[..., start : start + target_len]
+                    sig_clean = sig_clean[..., start : start + target_len]
+
+                # Normalize
+                if normalize == "noisy":
+                    fac = sig_noisy.abs().max()
+                elif normalize == "clean":
+                    fac = sig_clean.abs().max()
                 else:
-                    start = (orig_len - target_len) // 2
-                sig_noisy = sig_noisy[..., start : start + target_len]
-                sig_clean = sig_clean[..., start : start + target_len]
+                    fac = 1.0
 
-            # 5) normalize
-            if normalize == "noisy":
-                fac = sig_noisy.abs().max()
-            elif normalize == "clean":
-                fac = sig_clean.abs().max()
-            else:
-                fac = 1.0
+                # Convert labels to tensors
+                # Convert SNR to float tensor
+                if snr_db is not None:
+                    snr_db = torch.tensor(float(snr_db), dtype=torch.float32)
+                # Convert noise_type_id to int tensor (if string, map to int)
+                if noise_type_id is not None:
+                    if isinstance(noise_type_id, str):
+                        # Map noise type strings to IDs (can be customized)
+                        noise_type_map = {
+                            "white": 0, "babble": 1, "street": 2, "car": 3, "other": 4
+                        }
+                        noise_type_id = noise_type_map.get(noise_type_id.lower(), 4)
+                    noise_type_id = torch.tensor(int(noise_type_id), dtype=torch.long)
+                
+                return sig_noisy / fac, sig_clean / fac, snr_db, noise_type_id
+        else:
+            @sb.utils.data_pipeline.takes("noisy_wav", "clean_wav")
+            @sb.utils.data_pipeline.provides("noisy_sig", "clean_sig")
+            def wav_pairs(noisy_wav, clean_wav):
+                # Load waveforms
+                sig_noisy = sb.dataio.dataio.read_audio(noisy_wav)
+                sig_clean = sb.dataio.dataio.read_audio(clean_wav)
 
-            return sig_noisy / fac, sig_clean / fac
+                orig_len = sig_clean.shape[-1]
+                # Pad if too short
+                if orig_len < target_len:
+                    needed = target_len - orig_len
+                    left_pad = needed // 2
+                    right_pad = needed - left_pad
+                    sig_noisy = F.pad(
+                        sig_noisy, (left_pad, right_pad), mode="constant"
+                    )
+                    sig_clean = F.pad(
+                        sig_clean, (left_pad, right_pad), mode="constant"
+                    )
+                # Crop if too long
+                elif orig_len > target_len:
+                    if random_crop:
+                        start = np.random.randint(0, orig_len - target_len)
+                    else:
+                        start = (orig_len - target_len) // 2
+                    sig_noisy = sig_noisy[..., start : start + target_len]
+                    sig_clean = sig_clean[..., start : start + target_len]
+
+                # Normalize
+                if normalize == "noisy":
+                    fac = sig_noisy.abs().max()
+                elif normalize == "clean":
+                    fac = sig_clean.abs().max()
+                else:
+                    fac = 1.0
+
+                return sig_noisy / fac, sig_clean / fac
 
         return [wav_pairs]
 
+    # Check if labels are available in the dataset
+    # Try to load a sample to check for label fields
+    use_labels = hparams.get("use_snr_noise_labels", False)
+    if use_labels:
+        # Verify labels exist by checking first JSON entry
+        try:
+            import json
+            sample_json = hparams.get("train_annotation", hparams.get("valid_annotation", ""))
+            if sample_json:
+                with open(sample_json, 'r') as f:
+                    sample_data = json.load(f)
+                    if sample_data and len(sample_data) > 0:
+                        first_item = sample_data[0] if isinstance(sample_data, list) else list(sample_data.values())[0]
+                        if "snr_db" not in first_item or "noise_type_id" not in first_item:
+                            print("Warning: use_snr_noise_labels=True but labels not found in JSON. Disabling labels.")
+                            use_labels = False
+        except Exception as e:
+            print(f"Warning: Could not verify label availability: {e}. Disabling labels.")
+            use_labels = False
+    
     # create datasets
     datasets = {}
     for split, rc in zip(
         ["train", "valid", "test"],
         [random_crop_train, random_crop_valid, random_crop_test],
     ):
-        pipelines = build_pipeline(rc)
+        pipelines = build_pipeline(rc, use_labels=use_labels)
         json_path = hparams[f"{split}_annotation"]
+        if use_labels:
+            output_keys = ["id", "noisy_sig", "clean_sig", "snr_db", "noise_type_id"]
+        else:
+            output_keys = ["id", "noisy_sig", "clean_sig"]
         datasets[split] = sb.dataio.dataset.DynamicItemDataset.from_json(
             json_path=json_path,
             replacements={"data_root": data_dir},
             dynamic_items=pipelines,
-            output_keys=["id", "noisy_sig", "clean_sig"],
+            output_keys=output_keys,
         )
 
     # optional length sorting
