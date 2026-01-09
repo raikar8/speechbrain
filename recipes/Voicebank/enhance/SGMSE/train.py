@@ -25,6 +25,21 @@ class SGMSEBrain(sb.Brain):
     A Brain class to train an SGMSE-based diffusion model.
     """
 
+    def _get_score_model(self):
+        """
+        Get the unwrapped score model (handles DDP wrapping).
+        
+        Returns
+        -------
+        nn.Module
+            The actual score model, unwrapped from DDP if needed.
+        """
+        model = self.modules["score_model"]
+        # If wrapped with DDP, access the underlying model via .module
+        if hasattr(model, "module"):
+            return model.module
+        return model
+
     def on_fit_start(self):
         """
         Called once in the beginning of training.
@@ -33,7 +48,8 @@ class SGMSEBrain(sb.Brain):
 
         self.writer = SummaryWriter(log_dir=self.hparams.save_dir)
 
-        ema = self.modules["score_model"].ema
+        score_model = self._get_score_model()
+        ema = score_model.ema
         self.checkpointer.add_recoverable(
             name="ema",
             obj=ema,
@@ -63,7 +79,8 @@ class SGMSEBrain(sb.Brain):
         Loads the checkpoint, restores the EMA shadow weights,
         swaps them into the DNN, and prepares STFT objects.
         """
-        ema_obj = self.modules["score_model"].ema
+        score_model = self._get_score_model()
+        ema_obj = score_model.ema
         if "ema" not in self.checkpointer.recoverables:
             self.checkpointer.add_recoverable(
                 name="ema",
@@ -78,7 +95,8 @@ class SGMSEBrain(sb.Brain):
         self.checkpointer.recover_if_possible()
 
         # Store EMA
-        self.modules["score_model"].store_ema()
+        score_model = self._get_score_model()
+        score_model.store_ema()
 
         # STFT
         n_fft = self.hparams.n_fft
@@ -89,7 +107,7 @@ class SGMSEBrain(sb.Brain):
             n_fft=n_fft, hop_length=hop, center=True, return_complex=True
         )
 
-    def _step(self, x, y, model, snr_db=None, noise_type_id=None):
+    def _step(self, x, y, model_ddp, model_unwrapped, snr_db=None, noise_type_id=None):
         """
         Perform a single diffusion step for the score-based model.
 
@@ -103,8 +121,10 @@ class SGMSEBrain(sb.Brain):
             Clean input signal spectrogram, of shape (B, 1, F, T).
         y: torch.Tensor
             Conditioning or auxiliary input spectrogram, of shape (B, 1, F, T).
-        model: nn.Module
-            Score-based generative model that contains the SDE and the forward method.
+        model_ddp: nn.Module
+            DDP-wrapped model for forward passes (ensures proper gradient sync).
+        model_unwrapped: nn.Module
+            Unwrapped model for accessing attributes like .sde, .t_eps.
         snr_db: torch.Tensor, optional
             Ground-truth SNR in dB, shape (B,). Used for noise-based MoE routing.
         noise_type_id: torch.Tensor, optional
@@ -125,12 +145,13 @@ class SGMSEBrain(sb.Brain):
         x: torch.Tensor
             Clean input signal spectrogram, of shape (B, 1, F, T).
         """
+        # Use unwrapped model for accessing attributes
         t = (
             torch.rand(x.shape[0], device=x.device)
-            * (model.sde.T - model.t_eps)
-            + model.t_eps
+            * (model_unwrapped.sde.T - model_unwrapped.t_eps)
+            + model_unwrapped.t_eps
         )  # (B,)
-        mean, std = model.sde.marginal_prob(
+        mean, std = model_unwrapped.sde.marginal_prob(
             x, y, t
         )  # (B,1,F,T) and (B,) respectively
         z = torch.randn_like(
@@ -138,11 +159,12 @@ class SGMSEBrain(sb.Brain):
         )  # (B,1,F,T), i.i.d. normal distributed with var=0.5
         sigma = std[:, None, None, None]  # (B,1,1,1)
         x_t = mean + sigma * z  # (B,1,F,T)
+        # Use DDP-wrapped model for forward pass (ensures proper gradient sync)
         # Pass x (clean signal) and labels if model supports it (for noise-based MoE)
-        if hasattr(model, '_estimate_snr'):
-            forward_out = model(x_t, y, t, x=x, snr_db=snr_db, noise_type_id=noise_type_id)
+        if hasattr(model_unwrapped, '_estimate_snr'):
+            forward_out = model_ddp(x_t, y, t, x=x, snr_db=snr_db, noise_type_id=noise_type_id)
         else:
-            forward_out = model(x_t, y, t)
+            forward_out = model_ddp(x_t, y, t)
 
         return {
             "forward_out": forward_out,
@@ -177,8 +199,13 @@ class SGMSEBrain(sb.Brain):
             the model prediction and any enhanced waveforms if generated).
         """
         # Model and batch preparation
-        model = self.modules["score_model"]
         batch = batch.to(self.device)
+
+        # Get model (use DDP wrapper for forward passes, unwrapped for attributes)
+        # For forward passes, we use the DDP-wrapped model to ensure proper gradient sync
+        model_ddp = self.modules["score_model"]
+        # For accessing attributes like .sde, we need the unwrapped model
+        model_unwrapped = self._get_score_model()
 
         # Extract waveforms
         x_wav = batch.clean_sig.data  # (B,S)
@@ -208,7 +235,8 @@ class SGMSEBrain(sb.Brain):
         x = self.spec_fwd(self.stft(x_wav)).unsqueeze(1)  # (B,1,F,T)
         y = self.spec_fwd(self.stft(y_wav)).unsqueeze(1)  # (B,1,F,T)
 
-        outs = self._step(x, y, model, snr_db=snr_db, noise_type_id=noise_type_id)
+        # Pass both models: DDP for forward, unwrapped for attributes
+        outs = self._step(x, y, model_ddp, model_unwrapped, snr_db=snr_db, noise_type_id=noise_type_id)
 
         # TRAIN: never run enhancement
         if stage == sb.Stage.TRAIN:
@@ -237,8 +265,8 @@ class SGMSEBrain(sb.Brain):
         # Save original length in time dimension
         T_orig_wav = y_wav.size(1)
 
-        # Enhancement
-        x_hat = model.enhance(
+        # Enhancement (use unwrapped model for inference)
+        x_hat = model_unwrapped.enhance(
             y,
             sampler_type=self.hparams.sampling["sampler_type"],
             predictor=self.hparams.sampling["predictor"],
@@ -295,7 +323,7 @@ class SGMSEBrain(sb.Brain):
         loss: torch.Tensor
             The computed diffusion loss for this batch.
         """
-        model = self.modules["score_model"]
+        model = self._get_score_model()
 
         # Extract items from predictions
         forward_out = predictions["forward_out"]  # (B,1,F,T)
@@ -379,7 +407,8 @@ class SGMSEBrain(sb.Brain):
         loss = super().fit_batch(batch)
 
         # Update EMA for the diffusion model
-        self.modules["score_model"].update_ema()
+        score_model = self._get_score_model()
+        score_model.update_ema()
 
         return loss
 
@@ -397,7 +426,7 @@ class SGMSEBrain(sb.Brain):
         x_hat_wav: torch.Tensor
             Enhanced signal, of shape (1, T).
         """
-        model = self.modules["score_model"]
+        model = self._get_score_model()
 
         norm = y.abs().max()
         y = y / norm
@@ -445,19 +474,20 @@ class SGMSEBrain(sb.Brain):
         -------
         None
         """
+        # Use unwrapped model for compute_loss (handles DDP)
+        score_model = self._get_score_model()
         self.loss_metric = MetricStats(
-            metric=lambda forward_out, x_t, z, t, mean, x: self.modules[
-                "score_model"
-            ].compute_loss(forward_out, x_t, z, t, mean, x, reduction="none")
+            metric=lambda forward_out, x_t, z, t, mean, x: score_model.compute_loss(
+                forward_out, x_t, z, t, mean, x, reduction="none"
+            )
         )
 
         if stage == sb.Stage.TRAIN:
             return  # Nothing else to prepare for TRAIN
 
         if stage == sb.Stage.VALID:
-            self.modules[
-                "score_model"
-            ].store_ema()  # Only for VALID, because TEST is wrapped in on_evaluate_start()
+            score_model = self._get_score_model()
+            score_model.store_ema()  # Only for VALID, because TEST is wrapped in on_evaluate_start()
             self.eval_files_left = self.hparams.modules[
                 "score_model"
             ].num_eval_files
@@ -540,9 +570,8 @@ class SGMSEBrain(sb.Brain):
         self.writer.add_scalar(f"SI-SDR_{stage_name}", avg_sisdr, epoch)
 
         if stage == sb.Stage.VALID:
-            self.modules[
-                "score_model"
-            ].restore_ema()  # Only for VALID, because TEST is wrapped in on_evaluate_end()
+            score_model = self._get_score_model()
+            score_model.restore_ema()  # Only for VALID, because TEST is wrapped in on_evaluate_end()
             self.checkpointer.save_and_keep_only(
                 meta={f"{stage_name}_loss": avg_loss},
                 min_keys=[f"{stage_name}_loss"],
@@ -564,7 +593,8 @@ class SGMSEBrain(sb.Brain):
             Key used to track minimum metric value.
         """
         # Swap in the EMA weights for evaluation
-        self.modules["score_model"].store_ema()
+        score_model = self._get_score_model()
+        score_model.store_ema()
         super().on_evaluate_start(max_key=max_key, min_key=min_key)
 
     def on_evaluate_end(self):
@@ -572,7 +602,8 @@ class SGMSEBrain(sb.Brain):
         Restore original weights after evaluation.
         """
         # Restore original weights
-        self.modules["score_model"].restore_ema()
+        score_model = self._get_score_model()
+        score_model.restore_ema()
         super().on_evaluate_end()
 
     def to_audio(brain, spec, length=None):
@@ -925,6 +956,9 @@ if __name__ == "__main__":
 
     with open(hparams_file, encoding="utf-8") as fin:
         hparams = load_hyperpyyaml(fin, overrides)
+
+    # Initialize ddp (useful only for multi-GPU DDP training)
+    sb.utils.distributed.ddp_init_group(run_opts)
 
     from voicebank_prepare import prepare_voicebank
 
